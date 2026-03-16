@@ -433,10 +433,12 @@ def phase_b_price_of_anarchy(
     print(f"\n  [B2] Computing per-expert-disabled perplexity...")
 
     n_experts = 8  # Will be updated from model
-    # Find MoE gate modules
+    # Find MoE gate/router modules
     gate_modules = {}
     for name, module in model.named_modules():
-        if type(module).__name__ in ("MixtralTopKRouter", "TopKRouter"):
+        mod_type = type(module).__name__
+        # Match any TopKRouter variant (Mixtral, Ernie, generic)
+        if "TopKRouter" in mod_type or "TopkRouter" in mod_type:
             layer_idx = 0
             parts = name.split(".")
             for j, p in enumerate(parts):
@@ -446,12 +448,18 @@ def phase_b_price_of_anarchy(
                     except ValueError:
                         pass
             gate_modules[layer_idx] = module
-            n_experts = module.num_experts if hasattr(module, "num_experts") else 8
+            if hasattr(module, "top_k"):
+                top_k = module.top_k
+            # Get n_experts from weight shape
+            if hasattr(module, "weight"):
+                n_experts = module.weight.shape[0]
+            elif hasattr(module, "num_experts"):
+                n_experts = module.num_experts
 
     if not gate_modules:
-        # Fallback: find gate Linear layers
+        # Fallback: find gate Linear layers (but NOT shared_experts)
         for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear) and "gate" in name:
+            if isinstance(module, torch.nn.Linear) and "gate" in name and "shared" not in name:
                 layer_idx = 0
                 parts = name.split(".")
                 for j, p in enumerate(parts):
@@ -479,50 +487,49 @@ def phase_b_price_of_anarchy(
         def __init__(self):
             self.masked_expert = -1  # -1 = no mask
             self.force_uniform = False
+            self.n_experts = n_experts
 
-        def hook_fn(self_mask, module, input, output):
+        def __call__(self, module, input, output):
             if isinstance(output, tuple) and len(output) == 3:
-                logits, scores, indices = output
+                logits = output[0]
+                indices = output[1]
+                weights = output[2]
+                dev = logits.device  # preserve original device
             elif isinstance(output, torch.Tensor):
                 logits = output
-                scores = None
                 indices = None
+                weights = None
+                dev = logits.device
             else:
                 return output
 
-            if self_mask.masked_expert >= 0:
-                # Set masked expert logits to -inf before topk
+            if self.masked_expert >= 0:
                 logits = logits.clone()
-                logits[:, self_mask.masked_expert] = -1e9
-                # Recompute topk
-                if scores is not None:
+                logits[:, self.masked_expert] = -1e9
+                if indices is not None and weights is not None:
                     probs = torch.softmax(logits.float(), dim=-1)
-                    top_k = scores.shape[-1]
-                    new_scores, new_indices = probs.topk(top_k, dim=-1)
-                    new_scores = new_scores / new_scores.sum(dim=-1, keepdim=True)
-                    return (logits, new_scores, new_indices)
+                    top_k = indices.shape[-1]
+                    new_weights, new_indices = probs.topk(top_k, dim=-1)
+                    new_weights = new_weights / torch.clamp(new_weights.sum(dim=-1, keepdim=True), min=1e-12)
+                    return (logits.to(dev), new_indices.to(dev), new_weights.to(weights.dtype).to(dev))
                 return logits
 
-            if self_mask.force_uniform:
+            if self.force_uniform:
                 logits = logits.clone()
-                logits.fill_(1.0 / logits.shape[-1])
-                if scores is not None:
-                    top_k = scores.shape[-1]
+                logits.fill_(1.0 / self.n_experts)
+                if indices is not None and weights is not None:
                     probs = torch.softmax(logits.float(), dim=-1)
-                    new_scores, new_indices = probs.topk(top_k, dim=-1)
-                    new_scores = new_scores / new_scores.sum(dim=-1, keepdim=True)
-                    return (logits, new_scores, new_indices)
+                    top_k = indices.shape[-1]
+                    new_weights, new_indices = probs.topk(top_k, dim=-1)
+                    new_weights = new_weights / torch.clamp(new_weights.sum(dim=-1, keepdim=True), min=1e-12)
+                    return (logits.to(dev), new_indices.to(dev), new_weights.to(weights.dtype).to(dev))
                 return logits
 
             return output
 
     mask = ExpertMask()
 
-    # We need to hook the right module
-    # For MixtralTopKRouter, hook on the router itself
-    hook_handle = target_gate.register_forward_hook(
-        lambda module, input, output: mask.hook_fn(mask, module, input, output)
-    )
+    hook_handle = target_gate.register_forward_hook(mask)
 
     # Test each expert disabled
     ppls_per_disabled = {}
@@ -632,7 +639,8 @@ def phase_c_braess_paradox(
     # Find all MoE gate modules
     gate_modules = {}
     for name, module in model.named_modules():
-        if type(module).__name__ in ("MixtralTopKRouter", "TopKRouter"):
+        mod_type = type(module).__name__
+        if "TopKRouter" in mod_type or "TopkRouter" in mod_type:
             parts = name.split(".")
             layer_idx = 0
             for j, p in enumerate(parts):
@@ -645,7 +653,7 @@ def phase_c_braess_paradox(
 
     if not gate_modules:
         for name, module in model.named_modules():
-            if isinstance(module, torch.nn.Linear) and "gate" in name:
+            if isinstance(module, torch.nn.Linear) and "gate" in name and "shared" not in name:
                 parts = name.split(".")
                 layer_idx = 0
                 for j, p in enumerate(parts):
@@ -656,9 +664,11 @@ def phase_c_braess_paradox(
                             pass
                 gate_modules[layer_idx] = module
 
-    n_experts = 8
+    n_experts = 64
     for m in gate_modules.values():
-        if hasattr(m, "num_experts"):
+        if hasattr(m, "weight"):
+            n_experts = m.weight.shape[0]
+        elif hasattr(m, "num_experts"):
             n_experts = m.num_experts
         elif hasattr(m, "out_features"):
             n_experts = m.out_features
@@ -685,14 +695,17 @@ def phase_c_braess_paradox(
 
                 def __call__(self, module, input, output):
                     if isinstance(output, tuple) and len(output) >= 3:
-                        logits, scores, indices = output[0], output[1], output[2]
+                        logits = output[0]
+                        indices = output[1]
+                        weights = output[2]
+                        dev = logits.device
                         logits = logits.clone()
                         logits[:, self.target_expert] = -1e9
                         probs = torch.softmax(logits.float(), dim=-1)
-                        top_k = scores.shape[-1]
-                        new_scores, new_indices = probs.topk(top_k, dim=-1)
-                        new_scores = new_scores / new_scores.sum(dim=-1, keepdim=True)
-                        return (logits, new_scores, new_indices)
+                        top_k = indices.shape[-1]
+                        new_weights, new_indices = probs.topk(top_k, dim=-1)
+                        new_weights = new_weights / torch.clamp(new_weights.sum(dim=-1, keepdim=True), min=1e-12)
+                        return (logits.to(dev), new_indices.to(dev), new_weights.to(weights.dtype).to(dev))
                     elif isinstance(output, torch.Tensor):
                         logits = output.clone()
                         logits[:, self.target_expert] = -1e9
